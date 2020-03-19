@@ -267,7 +267,7 @@ class DistributedFusedAdam(torch.optim.Optimizer):
 
     def _do_overlapped_reduction(self, param_i, param_grads_size, param_offset, grad):
         # handle overlapped reductions
-        torch.div(grad.view(-1), self._world_size, out=self._flat_grads[param_offset:param_offset+param_grads_size])
+        torch.div(grad.view(-1), 1, out=self._flat_grads[param_offset:param_offset+param_grads_size])
         self._grads_generated[param_i]=True
         if not self._last_step:
             if self._overlap_reductions:
