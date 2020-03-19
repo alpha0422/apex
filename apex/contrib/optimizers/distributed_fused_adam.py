@@ -410,7 +410,7 @@ class DistributedFusedAdam(torch.optim.Optimizer):
         for group in self.param_groups:
             # compute combined scale factor for this group
             combined_scale = self._global_scale
-            if group['max_grad_norm'] > 0 and math.isfinite(self.L2_grad_norm):
+            if group['max_grad_norm'] > 0:
                 combined_scale = group['max_grad_norm'] / (self.L2_grad_norm / self._global_scale + 1e-6)
                 combined_scale = self._global_scale / min(1, combined_scale)
 
@@ -552,12 +552,6 @@ class DistributedFusedAdam(torch.optim.Optimizer):
                             self._works.append(work)
                     self._wait_works()
                     self._do_compute_L2_grad_norm()
-                    for inv_block_id in range(self._num_blocks):
-                        block_id = self._num_blocks - inv_block_id - 1
-                        self._blk_st[block_id%len(self._blk_st)].wait_stream(torch.cuda.current_stream())
-                        with torch.cuda.stream(self._blk_st[block_id%len(self._blk_st)]):
-                            work = self._pipeline_block_step(block_id, self._flat_grads, self._new_params)
-                            self._works.append(work)
                 else:
                     # run full pipeline
                     for inv_block_id in range(self._num_blocks):
@@ -570,21 +564,9 @@ class DistributedFusedAdam(torch.optim.Optimizer):
                 # reductions done.
                 if self._compute_L2_grad_norm:
                     self._do_compute_L2_grad_norm()
-                # do step
-                for inv_block_id in range(self._num_blocks):
-                    block_id = self._num_blocks - inv_block_id - 1
-                    self._blk_st[block_id%len(self._blk_st)].wait_stream(torch.cuda.current_stream())
-                    with torch.cuda.stream(self._blk_st[block_id%len(self._blk_st)]):
-                        work = self._pipeline_block_step(block_id, self._flat_grads, self._new_params)
-                        self._works.append(work)
         else:
             if self._compute_L2_grad_norm:
                 self._do_compute_L2_grad_norm()
-
-        self._copy_to_fp32 = False
-        self._decomp_stats = None
-        self._current_block = self._num_blocks
-        self._grads_generated = [False]*len(self._grads_info)
 
     def revert_step(self):
         """Revert effect of previously calling partial_step.
@@ -593,35 +575,52 @@ class DistributedFusedAdam(torch.optim.Optimizer):
         for block_id in range(self._num_blocks):
             self._partial_step_single_shard(block_id, undo=True)
 
-    def step(self, closure=None):
+    def step(self, closure=None, update=True):
         loss = None
         if closure is not None:
             loss = closure()
 
+        # Currently step() is always called, need to provide user some
+        # cleanup API
+        if not math.isfinite(self.L2_grad_norm) or not update:
+            self._copy_to_fp32 = False
+            self._decomp_stats = None
+            self._current_block = self._num_blocks
+            self._grads_generated = [False]*len(self._grads_info)
+            self._new_params = None
+            return loss
+
+        # do step
+        for inv_block_id in range(self._num_blocks):
+            block_id = self._num_blocks - inv_block_id - 1
+            self._blk_st[block_id%len(self._blk_st)].wait_stream(torch.cuda.current_stream())
+            with torch.cuda.stream(self._blk_st[block_id%len(self._blk_st)]):
+                work = self._pipeline_block_step(block_id, self._flat_grads, self._new_params)
+                self._works.append(work)
+
+        self._copy_to_fp32 = False
+        self._decomp_stats = None
+        self._current_block = self._num_blocks
+        self._grads_generated = [False]*len(self._grads_info)
+
         self._wait_works()
 
-        # Check for overflow
-        # Store state for loss scaler calculation
-        self.strided_check_finite(self._new_params, stride=self._shard_size, start=0, end=self._net_total_param_size)
-        if self.peek_overflow:
-            print("Reverting step")
-            self.revert_step()
-        else:
-            # Copy self._new_params to model params
-            with torch.no_grad():
-                param_i = 0
-                for group in self.param_groups:
-                    for p in group['params']:
-                        if not p.requires_grad:
-                            continue
-                        state = self.state[p]
-                        if len(state) == 0:
-                            state['step'] = 0
-                        state['step'] += 1
-                        nels = p.numel()
-                        offset = self._grads_info[param_i]['param_offset']
-                        p.set_(self._new_params[offset:offset+nels].view_as(p))
-                        param_i += 1
+        # GNMT doesn't need to check overflow in Adam
+        # Copy self._new_params to model params
+        with torch.no_grad():
+            param_i = 0
+            for group in self.param_groups:
+                for p in group['params']:
+                    if not p.requires_grad:
+                        continue
+                    state = self.state[p]
+                    if len(state) == 0:
+                        state['step'] = 0
+                    state['step'] += 1
+                    nels = p.numel()
+                    offset = self._grads_info[param_i]['param_offset']
+                    p.set_(self._new_params[offset:offset+nels].view_as(p))
+                    param_i += 1
         self._new_params = None
 
         return loss
