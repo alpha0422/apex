@@ -62,6 +62,9 @@ class DistributedFusedAdam(torch.optim.Optimizer):
         if amsgrad:
             raise RuntimeError('DistributedFusedAdam does not support the AMSGrad variant.')
 
+        for p in params:
+            torch.distributed.broadcast(p, 0, async_op=False)
+
         defaults = dict(lr=lr, bias_correction=bias_correction,
                         betas=betas, eps=eps, weight_decay=weight_decay,
                         max_grad_norm=max_grad_norm)
