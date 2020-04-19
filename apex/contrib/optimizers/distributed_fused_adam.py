@@ -86,7 +86,12 @@ class DistributedFusedAdam(torch.optim.Optimizer):
         self._do_not_flatten_model = do_not_flatten_model
         self._full_pipeline = full_pipeline
         self._compute_L2_grad_norm = compute_L2_grad_norm
-        self._L2_grad_norm = torch.zeros([]).cuda() if self._compute_L2_grad_norm else None
+        if self._compute_L2_grad_norm:
+            self._L2_grad_norm = 0
+            self._L2_grad_norm_dev = torch.zeros([], device='cuda')
+        else:
+            self._L2_grad_norm = None
+            self._L2_grad_norm_dev = None
         self._group_size = torch.cuda.device_count() if dwu_group_size <= 0 else dwu_group_size
         self._world_size = torch.distributed.get_world_size()
         self._num_groups = self._world_size // self._group_size
@@ -251,12 +256,13 @@ class DistributedFusedAdam(torch.optim.Optimizer):
                     works[chunk].wait()
                     l2_grad_sq = grad_shards[self._rank_in_group].norm(dtype=torch.float32,p=2)**2
                     if block_id+1 == self._num_blocks and chunk == 0:
-                        self._L2_grad_norm = l2_grad_sq
+                        self._L2_grad_norm = None
+                        self._L2_grad_norm_dev = l2_grad_sq
                     else:
-                        self._L2_grad_norm += l2_grad_sq
+                        self._L2_grad_norm_dev += l2_grad_sq
                     if block_id == 0 and chunk+1 == self._num_chunks:
-                        torch.distributed.all_reduce(self._L2_grad_norm,group=self._l2_grad_norm_pg)
-                        self._L2_grad_norm.sqrt_()
+                        torch.distributed.all_reduce(self._L2_grad_norm_dev,group=self._l2_grad_norm_pg)
+                        self._L2_grad_norm_dev.sqrt_()
 
         self._reductions_works[block_id] = works
 
@@ -354,9 +360,19 @@ class DistributedFusedAdam(torch.optim.Optimizer):
                 1 if clear else 0)
 
     @property
-    def L2_grad_norm(self):
+    def L2_grad_norm_dev(self):
         if self._compute_L2_grad_norm:
             torch.cuda.current_stream().wait_stream(self._l2_grad_norm_st)
+            return self._L2_grad_norm
+        else:
+            return None
+
+    @property
+    def L2_grad_norm(self):
+        if self._compute_L2_grad_norm:
+            if self._L2_grad_norm is None:
+                torch.cuda.current_stream().wait_stream(self._l2_grad_norm_st)
+                self._L2_grad_norm = self._L2_grad_norm_dev.item()
             return self._L2_grad_norm
         else:
             return None
