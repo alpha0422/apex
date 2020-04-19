@@ -145,12 +145,15 @@ class DistributedFusedAdam(torch.optim.Optimizer):
         self._num_rs_pg = dwu_num_rs_pg
         self._num_ar_pg = dwu_num_ar_pg
         self._num_ag_pg = dwu_num_ag_pg
+        _afloat = torch.tensor([0], dtype=torch.float, device='cuda')
+        torch.distributed.all_reduce(_afloat)
         if self._num_groups > 1:
             self._ar_pg = []
             for dev_i in range(self._group_size):
                 ranks = [dev_i+j*self._group_size for j in range(self._num_groups)]
                 for i in range(self._num_ar_pg):
                     grp = torch.distributed.new_group(ranks=ranks)
+                    torch.distributed.all_reduce(_afloat, group=grp)
                     if torch.distributed.get_rank() in ranks:
                         self._ar_pg.append(grp)
             self._ar_st = [torch.cuda.Stream() for _ in range(self._num_ar_pg)]
@@ -164,6 +167,8 @@ class DistributedFusedAdam(torch.optim.Optimizer):
                 grp = torch.distributed.new_group(ranks=ranks)
                 if torch.distributed.get_rank() in ranks:
                     self._rs_pg.append(grp)
+            for grp in self._rs_pg:
+                torch.distributed.all_reduce(_afloat, group=grp)
             if self._compute_L2_grad_norm and torch.distributed.get_rank() in ranks:
                 #self._l2_grad_norm_pg = torch.distributed.new_group(ranks=ranks)
                 self._l2_grad_norm_pg = self._rs_pg[-1]
@@ -180,6 +185,8 @@ class DistributedFusedAdam(torch.optim.Optimizer):
                     grp = torch.distributed.new_group(ranks=ranks)
                     if torch.distributed.get_rank() in ranks:
                         self._ag_pg.append(grp)
+            for grp in self._ag_pg:
+                torch.distributed.all_reduce(_afloat, group=grp)
             self._ag_st = [torch.cuda.Stream() for _ in range(self._num_ag_pg)]
         self._l2_grad_norm_st = torch.cuda.Stream() if self._compute_L2_grad_norm else None
         self._completion_st = torch.cuda.Stream()
