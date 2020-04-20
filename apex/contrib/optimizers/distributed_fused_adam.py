@@ -40,6 +40,7 @@ class DistributedFusedAdam(torch.optim.Optimizer):
         https://openreview.net/forum?id=ryQu7f-RZ
     """
 
+    # TODO: spin reduction default to False
     def __init__(self, params,
                  lr=1e-3, bias_correction = True,
                  betas=(0.9, 0.999), eps=1e-8, eps_inside_sqrt = False,
@@ -49,7 +50,7 @@ class DistributedFusedAdam(torch.optim.Optimizer):
                  dwu_group_size=0, dwu_num_blocks=4, dwu_num_rs_pg=1, dwu_num_ar_pg=4,
                  dwu_num_ag_pg=0, revert_method=1, flat_mt=False,
                  dwu_num_chunks=4, predivide=True, e5m2_allgather=False,
-                 do_not_flatten_model=False):
+                 dwu_spin_reduction=True, do_not_flatten_model=False):
         global fused_adam_cuda
         fused_adam_cuda = importlib.import_module("fused_adam_cuda")
 
@@ -84,6 +85,8 @@ class DistributedFusedAdam(torch.optim.Optimizer):
         self._predivide = predivide
         self._e5m2_allgather = e5m2_allgather
         self._do_not_flatten_model = do_not_flatten_model
+        # TODO: with spin reduction, chunks is suggested as 2x IB communicators
+        self._spin_reduction = dwu_spin_reduction
         self._full_pipeline = full_pipeline
         self._compute_L2_grad_norm = compute_L2_grad_norm
         if self._compute_L2_grad_norm:
@@ -233,25 +236,64 @@ class DistributedFusedAdam(torch.optim.Optimizer):
         end = start + self._block_size
         grad_block = self._flat_grads[start:end]
 
-        works = [None]*self._num_chunks
-        for chunk in range(self._num_chunks):
-            grad_chunk = grad_block[chunk*self._chunk_size:(chunk+1)*self._chunk_size]
-            grad_shards = [grad_chunk[i*self._shard_size:(i+1)*self._shard_size] for i in range(self._group_size)]
-            rs_stream = self._rs_st[chunk%self._num_rs_pg]
-            rs_stream.wait_stream(torch.cuda.current_stream())
-            with torch.cuda.stream(rs_stream):
-                work = torch.distributed.reduce_scatter(grad_shards[self._rank_in_group],grad_shards,group=self._rs_pg[chunk%self._num_rs_pg],async_op=True,no_copy=True)
-            if self._num_groups > 1:
+        works = [None for _ in range(self._num_chunks)]
+        grad_shards_cache = [None for _ in range(self._num_chunks)]
+        if self._spin_reduction and self._num_groups > 1:
+            # Launch first half chunks' IB all-reduce, expect _num_chunks = 2 * _num_ar_pg to have good performance
+            # Launch IB all-reduce first since it takes longer time
+            # Launch reduce-scatter in another loop since there's chance to use NCCL group call for it
+            boundary = (self._num_chunks + 1) // 2
+            for chunk in range(boundary):
+                grad_chunk = grad_block[chunk*self._chunk_size:(chunk+1)*self._chunk_size]
+                grad_shards = [grad_chunk[i*self._shard_size:(i+1)*self._shard_size] for i in range(self._group_size)]
+                ar_stream = self._ar_st[chunk%self._num_ar_pg]
+                ar_stream.wait_stream(torch.cuda.current_stream())
+                with torch.cuda.stream(ar_stream):
+                    work = torch.distributed.all_reduce(grad_shards[self._rank_in_group],group=self._ar_pg[chunk%self._num_ar_pg],async_op=True)
+                grad_shards_cache[chunk] = grad_shards
+                works[chunk] = work
+            for chunk in range(boundary, self._num_chunks):
+                grad_chunk = grad_block[chunk*self._chunk_size:(chunk+1)*self._chunk_size]
+                grad_shards = [grad_chunk[i*self._shard_size:(i+1)*self._shard_size] for i in range(self._group_size)]
+                rs_stream = self._rs_st[chunk%self._num_rs_pg]
+                rs_stream.wait_stream(torch.cuda.current_stream())
+                with torch.cuda.stream(rs_stream):
+                    work = torch.distributed.reduce_scatter(grad_shards[self._rank_in_group],grad_shards,group=self._rs_pg[chunk%self._num_rs_pg],async_op=True,no_copy=True)
+                grad_shards_cache[chunk] = grad_shards
+                works[chunk] = work
+            for chunk in range(boundary, self._num_chunks):
+                grad_shards = grad_shards_cache[chunk]
                 ar_stream = self._ar_st[chunk%self._num_ar_pg]
                 with torch.cuda.stream(ar_stream):
-                    work.wait()
+                    works[chunk].wait()
                     work = torch.distributed.all_reduce(grad_shards[self._rank_in_group],group=self._ar_pg[chunk%self._num_ar_pg],async_op=True)
-            works[chunk] = work
-
-        if self._compute_L2_grad_norm:
+                works[chunk] = work
+            for chunk in range(boundary):
+                grad_shards = grad_shards_cache[chunk]
+                rs_stream = self._rs_st[chunk%self._num_rs_pg]
+                with torch.cuda.stream(rs_stream):
+                    works[chunk].wait()
+                    work = torch.distributed.reduce_scatter(grad_shards[self._rank_in_group],grad_shards,group=self._rs_pg[chunk%self._num_rs_pg],async_op=True,no_copy=True)
+                works[chunk] = work
+        else:
             for chunk in range(self._num_chunks):
                 grad_chunk = grad_block[chunk*self._chunk_size:(chunk+1)*self._chunk_size]
                 grad_shards = [grad_chunk[i*self._shard_size:(i+1)*self._shard_size] for i in range(self._group_size)]
+                rs_stream = self._rs_st[chunk%self._num_rs_pg]
+                rs_stream.wait_stream(torch.cuda.current_stream())
+                with torch.cuda.stream(rs_stream):
+                    work = torch.distributed.reduce_scatter(grad_shards[self._rank_in_group],grad_shards,group=self._rs_pg[chunk%self._num_rs_pg],async_op=True,no_copy=True)
+                if self._num_groups > 1:
+                    ar_stream = self._ar_st[chunk%self._num_ar_pg]
+                    with torch.cuda.stream(ar_stream):
+                        work.wait()
+                        work = torch.distributed.all_reduce(grad_shards[self._rank_in_group],group=self._ar_pg[chunk%self._num_ar_pg],async_op=True)
+                grad_shards_cache[chunk] = grad_shards
+                works[chunk] = work
+
+        if self._compute_L2_grad_norm:
+            for chunk in range(self._num_chunks):
+                grad_shards = grad_shards_cache[chunk]
                 with torch.cuda.stream(self._l2_grad_norm_st):
                     works[chunk].wait()
                     l2_grad_sq = grad_shards[self._rank_in_group].norm(dtype=torch.float32,p=2)**2
