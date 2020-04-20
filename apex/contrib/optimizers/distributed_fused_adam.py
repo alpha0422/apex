@@ -139,8 +139,8 @@ class DistributedFusedAdam(torch.optim.Optimizer):
             self._low_param_i[block_id] = p_i
         print(self._low_param_i)
 
-        self._flat_grads = torch.zeros([self._total_param_size]).half().cuda()
-        self._new_params = None
+        self._flat_grads = torch.zeros([self._total_param_size],device='cuda',dtype=torch.half)
+        self._new_params = torch.zeros([self._total_param_size],device='cuda',dtype=torch.uint8 if self._e5m2_allgather else torch.half)
         self._fp32_p = None
         self._fp32_m = None
         self._fp32_v = None
@@ -267,9 +267,6 @@ class DistributedFusedAdam(torch.optim.Optimizer):
         self._reductions_works[block_id] = works
 
     def _pipeline_block_step(self, block_id):
-        if self._new_params is None:
-            self._new_params = torch.zeros_like(self._flat_grads,dtype=torch.uint8 if self._e5m2_allgather else self._flat_grads.dtype)
-
         start = block_id * self._block_size
         end = start + self._block_size
         new_params_block = self._new_params[start:end]
@@ -607,8 +604,6 @@ class DistributedFusedAdam(torch.optim.Optimizer):
                                 self._overflow_buf,
                                 [p_in, p_out],
                                 1.0);
-            if not self._e5m2_allgather and not self._do_not_flatten_model:
-                self._new_params = None
 
         torch.cuda.current_stream().wait_stream(self._completion_st)
 
