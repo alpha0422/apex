@@ -202,6 +202,23 @@ class DistributedFusedAdam(torch.optim.Optimizer):
         import inspect
         assert ('no_copy' in inspect.getfullargspec(torch.distributed.reduce_scatter).args), "This version of c10d does not support no_copy option"
 
+        # cache to reduce CPU side operations
+        self._grad_shards = []        # shape: [blocks, chunks, groups]
+        self._new_params_shards = []  # shape: [blocks, chunks, groups]
+        for block_id in range(self._num_blocks):
+            start, stop = block_id * self._block_size, (block_id + 1) * self._block_size
+            grad_block = self._flat_grads[start:stop]
+            new_params_block = self._new_params[start:stop]
+            _grad_shards, _new_params_shards = [], []
+            for chunk in range(self._num_chunks):
+                grad_chunk = grad_block[chunk*self._chunk_size:(chunk+1)*self._chunk_size]
+                grad_shards = [grad_chunk[i*self._shard_size:(i+1)*self._shard_size] for i in range(self._group_size)]
+                _grad_shards.append(grad_shards)
+                new_params_chunk = new_params_block[chunk*self._chunk_size:(chunk+1)*self._chunk_size]
+                new_params_shards = [new_params_chunk[i*self._shard_size:(i+1)*self._shard_size] for i in range(self._group_size)]
+                _new_params_shards.append(new_params_shards)
+            self._grad_shards.append(_grad_shards)
+            self._new_params_shards.append(_new_params_shards)
 
     def set_last_step(self, last_step):
         self._last_step = last_step
@@ -229,14 +246,10 @@ class DistributedFusedAdam(torch.optim.Optimizer):
     def _pipeline_block_reductions(self, block_id):
         self._flatten_grad_mt(1.0/self._world_size if self._predivide else 1.0)
 
-        start = block_id * self._block_size
-        end = start + self._block_size
-        grad_block = self._flat_grads[start:end]
-
+        grad_block = self._grad_shards[block_id]
         works = [None]*self._num_chunks
         for chunk in range(self._num_chunks):
-            grad_chunk = grad_block[chunk*self._chunk_size:(chunk+1)*self._chunk_size]
-            grad_shards = [grad_chunk[i*self._shard_size:(i+1)*self._shard_size] for i in range(self._group_size)]
+            grad_shards = grad_block[chunk]
             rs_stream = self._rs_st[chunk%self._num_rs_pg]
             rs_stream.wait_stream(torch.cuda.current_stream())
             with torch.cuda.stream(rs_stream):
@@ -250,8 +263,7 @@ class DistributedFusedAdam(torch.optim.Optimizer):
 
         if self._compute_L2_grad_norm:
             for chunk in range(self._num_chunks):
-                grad_chunk = grad_block[chunk*self._chunk_size:(chunk+1)*self._chunk_size]
-                grad_shards = [grad_chunk[i*self._shard_size:(i+1)*self._shard_size] for i in range(self._group_size)]
+                grad_shards = grad_block[chunk]
                 with torch.cuda.stream(self._l2_grad_norm_st):
                     works[chunk].wait()
                     l2_grad_sq = grad_shards[self._rank_in_group].norm(dtype=torch.float32,p=2)**2
@@ -267,14 +279,10 @@ class DistributedFusedAdam(torch.optim.Optimizer):
         self._reductions_works[block_id] = works
 
     def _pipeline_block_step(self, block_id):
-        start = block_id * self._block_size
-        end = start + self._block_size
-        new_params_block = self._new_params[start:end]
-
+        new_params_block = self._new_params_shards[block_id]
         works = [None]*self._num_chunks
         for chunk in range(self._num_chunks):
-            new_params_chunk = new_params_block[chunk*self._chunk_size:(chunk+1)*self._chunk_size]
-            new_params_shards = [new_params_chunk[i*self._shard_size:(i+1)*self._shard_size] for i in range(self._group_size)]
+            new_params_shards = new_params_block[chunk]
             ag_stream = self._ag_st[chunk%self._num_ag_pg]
             with torch.cuda.stream(ag_stream):
                 self._reductions_works[block_id][chunk].wait()
