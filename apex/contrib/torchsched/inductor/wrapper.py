@@ -14,6 +14,7 @@ from __future__ import annotations
 import dataclasses
 from typing import TYPE_CHECKING
 
+from torch._inductor.codegen.wrapper import BufferLike
 from torch._inductor.codegen.wrapper import EnterDeviceContextManagerLine
 from torch._inductor.codegen.wrapper import ExitDeviceContextManagerLine
 from torch._inductor.codegen.wrapper import IndentedBuffer
@@ -30,6 +31,7 @@ from apex.contrib.torchsched.inductor._utils import STREAM_NAME_TEMPLATE
 from apex.contrib.torchsched.inductor._utils import get_stream_name
 
 if TYPE_CHECKING:
+    from torch._inductor import ir
     from torch._inductor.graph import GraphLowering
     from torch._inductor.ir import GraphPartitionSignature
 
@@ -88,17 +90,11 @@ class EnterCudaStreamContextLine(WrapperLine):
         stream_idx: The index number corresponds to the entering CUDA Stream context.
         upstream_events: Names of CUDA Events that the current stream should be waiting for before
             the stream switching.
-        buffers_from_other_streams: Name of buffers produced by other CUDA Streams. Those buffers
-            should be recorded to the current stream to avoid accidental memory free.
-        buffers_requiring_device_check: Name of buffers that might not be on CUDA devices and
-            require runtime device checking before recording stream to them.
     """
 
     wrapper: MultiStreamWrapperCodegen
     stream_idx: int
     upstream_events: set[CudaEventSym]
-    buffers_from_other_streams: set[str]
-    buffers_requiring_device_check: set[str]
 
     def __post_init__(self) -> None:
         """Construct stream name by the given index number."""
@@ -124,14 +120,17 @@ class EnterCudaStreamContextLine(WrapperLine):
         # exiting, as in :meth:`ExitCudaStreamContextLine.codegen`.
         assert code._indent == 3
 
-        for buff in self.buffers_from_other_streams:
-            prefix = f"if {buff}.is_cuda: " if buff in self.buffers_requiring_device_check else ""
-            code.writeline(f"{prefix}{buff}.record_stream({self.stream_name})")
-
 
 @dataclasses.dataclass
 class ExitCudaStreamContextLine(WrapperLine):
     """Generate code to exit the current stream context.
+
+    Attributes:
+        stream_idx: The index number corresponds to the entering CUDA Stream context.
+        buffers_from_other_streams: Name of buffers produced by other CUDA Streams. Those buffers
+            should be recorded to the current stream to avoid accidental memory free.
+        buffers_requiring_device_check: Name of buffers that might not be on CUDA devices and
+            require runtime device checking before recording stream to them.
 
     Note:
         Most attributes and checking logics of this class have been moved to
@@ -139,9 +138,24 @@ class ExitCudaStreamContextLine(WrapperLine):
         because the checking and unindent should be generated in the latter phase of code-gen.
     """
 
+    stream_idx: int
+    buffers_from_other_streams: set[str]
+    buffers_requiring_device_check: set[str]
+
+    def __post_init__(self) -> None:
+        """Construct stream name by the given index number."""
+        self.stream_name = get_stream_name(self.stream_idx)
+
     def codegen(self, code: IndentedBuffer) -> None:
         """Check indentation level and exit the current stream context."""
         assert code._indent == 3  # See :note:`The 3-indent-level assertion` above.
+
+        # Record the buffer created by another stream has been used by this stream, thus to avoid
+        # the buffer being freed before its usage on this stream.
+        for buff in self.buffers_from_other_streams:
+            prefix = f"if {buff}.is_cuda: " if buff in self.buffers_requiring_device_check else ""
+            code.writeline(f"{prefix}{buff}.record_stream({self.stream_name})")
+
         code.do_unindent()
 
 
@@ -181,6 +195,10 @@ class MultiStreamWrapperCodegen(PythonWrapperCodegen):
         super().__init__()
         self.current_stream_name: str | None = None
         self.write_get_raw_stream = self._write_get_raw_stream
+
+        # List of set of buffers created by other streams
+        self.ctx_buffers_from_other_streams: list[set[str]] = []
+        self.ctx_buffers_requiring_device_check: list[set[str]] = []
 
     @staticmethod
     def create(
@@ -254,11 +272,17 @@ class MultiStreamWrapperCodegen(PythonWrapperCodegen):
             self,
             stream_idx,
             upstream_events,
-            buffers_from_other_streams,
-            buffers_requiring_device_check,
         )
         self.writeline(ctx_entrance)
         self.current_stream_name = ctx_entrance.stream_name
+
+        # Within this stream's context, we need to `record_stream` for the buffers from
+        # other streams:
+        # 1. If such buffer is freed after its last usage, or;
+        # 2. On stream exit;
+        self.ctx_buffers_from_other_streams.append(buffers_from_other_streams)
+        self.ctx_buffers_requiring_device_check.append(buffers_requiring_device_check)
+
         return ctx_entrance
 
     def codegen_cuda_stream_exit(
@@ -281,8 +305,41 @@ class MultiStreamWrapperCodegen(PythonWrapperCodegen):
                 f"Attempting to exit from {stream_name} but the current stream context is "
                 f"{self.current_stream_name}",
             )
-        self.writeline(ExitCudaStreamContextLine())
+        buffers_from_other_streams = self.ctx_buffers_from_other_streams.pop()
+        buffers_requiring_device_check = self.ctx_buffers_requiring_device_check.pop()
+        ctx_exit = ExitCudaStreamContextLine(
+            stream_idx,
+            buffers_from_other_streams,
+            buffers_requiring_device_check,
+        )
+        self.writeline(ctx_exit)
         self.current_stream_name = None
+
+    def make_buffer_free(self, buffer: BufferLike | ir.TorchBindObject) -> str:
+        """Generate the code to free the given buffer.
+
+        If the buffer is on side-stream, then generate record_stream too.
+
+        Args:
+            buffer (BufferLike | ir.TorchBindObject): The buffer to be freed.
+
+        Returns:
+            str: Code string to free the buffer.
+        """
+        line = ""
+        buff = buffer.get_name()
+        if self.ctx_buffers_from_other_streams and buff in self.ctx_buffers_from_other_streams[-1]:
+            prefix = (
+                f"if {buff}.is_cuda: "
+                if buff in self.ctx_buffers_requiring_device_check[-1]
+                else ""
+            )
+            line = f"{prefix}{buff}.record_stream({self.current_stream_name})"
+            # This buffer will be freed, we shouldn't record_stream again on stream exit
+            self.ctx_buffers_from_other_streams[-1].remove(buff)
+        if line:
+            line += f"; del {buff}"
+        return line
 
     def codegen_sync_unjoined_cuda_events(self, events: set[CudaEventSym]) -> None:
         """Generate data structure for syncing hanging CUDA Events before program exit.

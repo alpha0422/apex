@@ -396,9 +396,10 @@ class MultiCudaStreamScheduler(Scheduler):
                 in :meth:`schedule_multi_cuda_streams`.
         """
         assert self.current_ctx_entrance is not None
+        wrapper_code = cast("MultiStreamWrapperCodegen", V.graph.wrapper_code)
         upstream_events, buffers_from_other_streams = self.get_cross_stream_dependencies(node)
         self.current_ctx_entrance.upstream_events |= upstream_events
-        self.current_ctx_entrance.buffers_from_other_streams |= buffers_from_other_streams
+        wrapper_code.ctx_buffers_from_other_streams[-1] |= buffers_from_other_streams
 
     def generate_stream_ctx_switching(self, node: BaseSchedulerNode) -> None:
         """Generate stream entering and exiting to properly run node in a multi-stream scenario.
