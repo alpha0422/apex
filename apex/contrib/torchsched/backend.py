@@ -306,7 +306,7 @@ def get_backend(
         return DecompositionsWrapper(
             mode="default",
             # TODO(@davidli): Elegantly solve cross-stream buffer reusing conflicts.
-            options={"allow_buffer_reuse": False},
+            options={"allow_buffer_reuse": False, "inplace_buffers": False},
             dynamic=False,
             decompositions={
                 aten.convolution_backward.default: convolution_backward_decomp_dwb,
@@ -315,7 +315,7 @@ def get_backend(
     elif scheme == "wbd":
         return DecompositionsWrapper(
             mode="default",
-            options={"allow_buffer_reuse": False},
+            options={"allow_buffer_reuse": False, "inplace_buffers": False},
             dynamic=False,
             decompositions={
                 aten.convolution_backward.default: convolution_backward_decomp_wbd,
